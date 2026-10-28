@@ -25,6 +25,13 @@ generation, repository edits, or profiles/models without matching trial evidence
 Each registry `verifier_path` and `expected_fixture_path` is resolved relative to the directory
 containing that registry file; pin the SHA-256 of the full registry bytes in the profile config.
 
+Auxiliary model calls are intentionally excluded from this capability: compression summaries,
+memory/search/vision helpers, and auxiliary recovery/fallback destinations that resolve to a local
+endpoint are refused before provider I/O because those calls do not carry the task/run-bound GPU
+lease. A refusal during compression is terminal and must not retry through the main model. This
+keeps the current fixed-JSON envelope tool-free and one-request-only; do not interpret the auxiliary
+deny path as support for local auxiliary inference.
+
 ## Profile configuration (example only)
 
 Configure the plugin inside each eligible profile's `config.yaml`; this candidate does not edit
