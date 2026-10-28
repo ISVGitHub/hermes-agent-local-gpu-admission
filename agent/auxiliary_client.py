@@ -80,6 +80,46 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()
 
 
+class LocalAuxiliaryAdmissionRequired(RuntimeError):
+    """A local auxiliary route has no task/run-bound admission in this call path."""
+
+
+def _require_nonlocal_auxiliary_route(
+    client: Any, provider: str | None, task: str | None, *, base_url: str | None = None,
+) -> None:
+    """Fail closed before auxiliary Relay/provider I/O on any local/private endpoint.
+
+    Auxiliary calls do not carry the primary turn's verified capability and GPU lease. In
+    particular, the auxiliary recovery ladder may retry or switch providers, so admitting a
+    local auxiliary hop from the primary turn's identity would overstate the measured scope.
+    Until that scope is explicitly propagated and revalidated, keep cloud routes unchanged and
+    refuse local hops before Relay or SDK code can send them.
+    """
+    bases = []
+    current = client
+    for _ in range(4):
+        if current is None:
+            break
+        base = str(getattr(current, "base_url", "") or "").strip()
+        if base:
+            bases.append(base)
+        current = getattr(current, "_client", None)
+    base_url = str(base_url or (bases[0] if bases else ""))
+    try:
+        from hermes_cli.middleware import _is_local_llm_route
+
+        local = _is_local_llm_route(provider, base_url)
+    except Exception:
+        # If route classification itself is unavailable, fail closed instead of allowing
+        # an auxiliary request whose endpoint cannot be classified.
+        local = True
+    if local:
+        raise LocalAuxiliaryAdmissionRequired(
+            f"Local auxiliary route refused before inference (task={task or 'call'}); "
+            "this path has no task/run-bound GPU admission"
+        )
+
+
 # Availability probe mode: check_fns only need to know whether a client is RESOLVABLE, so
 # inside `aux_probe_mode()` constructors return a stub instead of importing openai + building
 # httpx/SSL (~0.3s on CLI startup). Stubs are never cached (see _store_cached_client).
@@ -2628,6 +2668,8 @@ def _relay_sync_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    _require_nonlocal_auxiliary_route(client, provider, relay_context.get("task"))
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
     kwargs = prepare_chat_messages(client, kwargs)
@@ -2667,6 +2709,8 @@ async def _relay_async_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    _require_nonlocal_auxiliary_route(client, provider, relay_context.get("task"))
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
     kwargs = prepare_chat_messages(client, kwargs)
@@ -2696,6 +2740,8 @@ async def _relay_async_completion(
 def _relay_sync_stream(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
 ) -> Any:
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    _require_nonlocal_auxiliary_route(client, provider, relay_context.get("task"))
     from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
 
     kwargs = prepare_chat_messages(client, kwargs)
@@ -4126,6 +4172,7 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
+        _require_nonlocal_auxiliary_route(client, dest.provider, task, base_url=dest.base_url)
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -4183,6 +4230,7 @@ async def _call_fallback_candidate_async(
 
     async def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
         import asyncio
+        _require_nonlocal_auxiliary_route(client, dest.provider, task, base_url=dest.base_url)
         return await asyncio.to_thread(
             _validate_llm_response,
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
@@ -7492,6 +7540,7 @@ def _prepare_aux_request(
             logger.info("Auxiliary %s: using %s (%s)%s",
                          task, request_provider or "auto", final_model or "default",
                          f" at {base_info}" if base_info and "openrouter" not in base_info else "")
+    _require_nonlocal_auxiliary_route(client, request_provider, task, base_url=base_info or resolved_base_url)
     # Client's actual base_url so endpoint-specific temperature overrides work on
     # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
     kwargs = _build_call_kwargs(
@@ -8161,6 +8210,7 @@ def _call_llm_impl(
         if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
             # Responses-shim clients consume the stream internally and return a completed
             # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
+            _require_nonlocal_auxiliary_route(client, request_provider, task)
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 

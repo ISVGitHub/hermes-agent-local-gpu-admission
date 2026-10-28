@@ -1263,6 +1263,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    from hermes_cli.middleware import require_local_model_admission
+    require_local_model_admission(agent, api_kwargs, streaming=False)
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -3979,6 +3981,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    from hermes_cli.middleware import require_local_model_admission
+    require_local_model_admission(agent, api_kwargs, streaming=True)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":

@@ -24,6 +24,7 @@ class Model(BaseHTTPRequestHandler):
             self.server.requests.append(body)
         if messages and not self.server.blocked.is_set():
             self.server.blocked.set()
+            # Keep the blocking window below the test runner's per-file deadline.
             assert self.server.release.wait(65)
         if messages and self.server.mode in {'rate_limit', 'billing'}:
             payload = json.dumps({'error': {'message': 'Rate limit exceeded' if self.server.mode == 'rate_limit' else 'Insufficient quota',
@@ -69,8 +70,17 @@ def main():
     peer.mode = os.environ.get('KANBAN_PROBE_MODE', 'complete')
     peer.blocked, peer.release = threading.Event(), threading.Event()
     threading.Thread(target=peer.serve_forever, daemon=True).start()
-    url = f'http://127.0.0.1:{peer.server_port}/v1'
-    os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
+    # Keep this generic dispatcher lifecycle probe outside the local-model gate:
+    # the fake OpenAI-compatible service is reached through an explicit loopback
+    # HTTP proxy, while the configured provider endpoint is a reserved .invalid
+    # host. If the proxy is ignored, DNS fails instead of sending a test prompt
+    # to the public network.
+    url = 'http://api.test.invalid/v1'
+    proxy_url = f'http://127.0.0.1:{peer.server_port}'
+    no_proxy = '127.0.0.1,localhost,::1'
+    os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url,
+                      HTTP_PROXY=proxy_url, http_proxy=proxy_url,
+                      NO_PROXY=no_proxy, no_proxy=no_proxy)
     workspace = home / 'workspace'
     workspace.mkdir(exist_ok=True)
     skill = home / 'skills' / 'owned-skill'

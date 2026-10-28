@@ -2140,8 +2140,12 @@ def _dispatch_lane_task(
             result.auto_blocked.append(claimed.id)
         return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    # Keep the in-memory Task handed to the worker-spawn boundary in sync with the
+    # persisted run contract; scratch workspace rows start with workspace_path=NULL.
+    claimed.workspace_path = str(workspace)
     if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        claimed.branch_name = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+        _kbw.set_branch_name(conn, claimed.id, claimed.branch_name)
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
@@ -2832,6 +2836,20 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Local-model admission binds the capability declaration and full contract to this
+    # exact dispatcher-owned task/run. These values are hints only: the controller must
+    # read the pinned DB row and recompute the digest before acquiring a GPU lease.
+    from hermes_cli.kanban_local_model_scope import capability_id_from_body, task_run_contract_sha256
+    capability_id = capability_id_from_body(task.body)
+    if capability_id:
+        env["HERMES_KANBAN_CAPABILITY_ID"] = capability_id
+        try:
+            env["HERMES_KANBAN_CONTRACT_SHA256"] = task_run_contract_sha256(task)
+        except ValueError:
+            env.pop("HERMES_KANBAN_CONTRACT_SHA256", None)
+    else:
+        env.pop("HERMES_KANBAN_CAPABILITY_ID", None)
+        env.pop("HERMES_KANBAN_CONTRACT_SHA256", None)
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:

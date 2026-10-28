@@ -67,6 +67,22 @@ class TestClassifiedError:
         assert e3.is_auth is False
 
 
+class TestLocalAdmissionError:
+    def test_admission_block_is_terminal_and_never_falls_back(self):
+        from hermes_cli.middleware import LocalModelAdmissionBlockedError
+
+        result = classify_api_error(
+            LocalModelAdmissionBlockedError("missing_admission_identity"),
+            provider="ollama", model="gemma4:12b-64k",
+        )
+
+        assert result.reason == FailoverReason.local_admission_blocked
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is False
+
+
 
 # ── Test: Status code extraction ───────────────────────────────────────
 

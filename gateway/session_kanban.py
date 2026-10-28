@@ -58,15 +58,38 @@ def build_kanban_policy(connection, params, config):
     if policy.model is None:
         from gateway.run import _resolve_gateway_model
         policy = replace(policy, model=_resolve_gateway_model(policy.config()))
+    from hermes_cli.kanban_local_model_scope import capability_id_from_body, task_run_contract_sha256
+    capability_marker_declared = 'Local-GPU-Capability:' in (task.body or '')
+    capability_id = capability_id_from_body(task.body)
+    if capability_marker_declared and not capability_id:
+        raise RuntimeStoreError('invalid_local_gpu_capability_declaration')
+    if capability_id:
+        # The measured local capability is a single tool-free JSON response. Capture its
+        # task contract in the trusted dispatcher frame and remove every model-visible tool;
+        # completion is performed by the worker only after the pinned verifier accepts it.
+        if (task.completion_contract != "local-only" or task.workspace_kind != "scratch"
+                or task.goal_mode or not task.model_override or not task.provider_override):
+            raise RuntimeStoreError('invalid_local_gpu_task_contract')
+        workspace_path = Path(task.workspace_path or "").resolve(strict=True)
+        if (not workspace_path.is_dir()
+                or not kb._is_managed_scratch_path(workspace_path)):
+            raise RuntimeStoreError('invalid_local_gpu_managed_workspace')
+        task_contract_sha256 = task_run_contract_sha256(task)
+        toolsets = ()
+    else:
+        task_contract_sha256 = ""
+        toolsets = tuple(sorted(set(policy.toolsets) | {'kanban'}))
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+    context['capability_id'] = capability_id
+    context['task_contract_sha256'] = task_contract_sha256
     context['db'] = str(path)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
-    return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
+    return replace(policy, source='kanban', platform='cli', toolsets=toolsets,
                    request_json=json.dumps(request, sort_keys=True), kanban_json=json.dumps(context)), private
 
 
@@ -165,6 +188,9 @@ def bind_worker_context(frame):
         'HERMES_KANBAN_CLAIM_LOCK': context['claim_lock'], 'HERMES_KANBAN_WORKSPACE': context['workspace'],
         'HERMES_KANBAN_WORKSPACES_ROOT': context['workspaces_root'], 'HERMES_PROFILE': context['profile'],
         'HERMES_SESSION_SOURCE': 'kanban'}
+    if context.get('capability_id'):
+        env['HERMES_KANBAN_CAPABILITY_ID'] = context['capability_id']
+        env['HERMES_KANBAN_CONTRACT_SHA256'] = context['task_contract_sha256']
     for key, value in (('HERMES_KANBAN_BRANCH', context['branch']), ('HERMES_TENANT', context['tenant'])):
         if value:
             env[key] = value
@@ -387,7 +413,30 @@ def _run_task_turns(agent, frame, history, context):
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
-    result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+    local_capability = str(context.get('capability_id') or '')
+    if local_capability:
+        agent._local_gpu_admission_defer_release = True
+    try:
+        result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
+        if local_capability:
+            _complete_local_json_task(agent, result, context)
+    except Exception as exc:
+        if local_capability:
+            _block_local_json_task(context, f'Локальная задача остановлена: {str(exc)[:240]}')
+        raise
+    finally:
+        if local_capability:
+            try:
+                from hermes_cli.middleware import release_local_gpu_admission_leases
+                lease_ids = tuple(getattr(agent, '_local_gpu_admission_lease_ids', ()) or ())
+                scope = dict(getattr(agent, '_local_gpu_admission_scope', {}) or {})
+                if lease_ids and release_local_gpu_admission_leases(lease_ids=lease_ids, scope=scope):
+                    agent._local_gpu_admission_lease_ids = ()
+                    agent._local_gpu_admission_scope = {}
+                elif lease_ids:
+                    raise RuntimeError('GPU lease release failed; controller reconciliation is required')
+            finally:
+                agent._local_gpu_admission_defer_release = False
 
     def recover(nudge):
         nonlocal result
@@ -423,3 +472,67 @@ def _run_task_turns(agent, frame, history, context):
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
         first_response=result.get('final_response', ''))
     return result
+
+
+def _block_local_json_task(context, reason):
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli import kanban_db as kb
+    with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+        task = kb.get_task(conn, context['task_id'])
+        if task and task.status == 'running' and task.current_run_id == context['run_id']:
+            kb.block_task(conn, context['task_id'], reason=reason,
+                          expected_run_id=context['run_id'])
+
+
+def _complete_local_json_task(agent, result, context):
+    """Persist one model response through the trusted verifier while its GPU lease is live."""
+    import json
+    import os
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.turn_exit import turn_exit_code
+
+    if turn_exit_code(result, kanban_worker=True) != 0:
+        raise RuntimeError('model turn did not finish successfully; no artifact was accepted')
+    if int(getattr(agent, '_api_call_count', 0) or 0) != 1:
+        raise RuntimeError('fixed-JSON capability requires exactly one model request')
+    response = result.get('final_response') if isinstance(result, dict) else None
+    if not isinstance(response, str) or not response.strip():
+        raise RuntimeError('model returned no JSON artifact')
+    artifact_bytes = response.strip().encode('utf-8')
+    if len(artifact_bytes) > 1024 * 1024:
+        raise RuntimeError('model JSON artifact exceeds the 1 MiB verifier limit')
+    workspace = Path(context['workspace']).resolve(strict=True)
+    artifact = workspace / '.local-gpu-result.json'
+    # O_EXCL rejects pre-existing files and symlinks; the model never chooses a path.
+    fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(artifact_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            artifact.unlink()
+        except OSError:
+            pass
+        raise
+    from tools.kanban_tools import _handle_complete
+    completion = _handle_complete({
+        'task_id': context['task_id'],
+        'board': context['board'],
+        'summary': 'Fixed-JSON output passed the pinned independent verifier.',
+        'artifacts': [str(artifact)],
+    })
+    with connect_closing(Path(context['db'])) as conn:
+        task = kb.get_task(conn, context['task_id'])
+        run = conn.execute(
+            'SELECT task_id,status,outcome,ended_at FROM task_runs WHERE id=?',
+            (context['run_id'],),
+        ).fetchone()
+        if (task is None or task.status != 'done' or run is None
+                or run['task_id'] != context['task_id'] or run['status'] != 'done'
+                or run['outcome'] != 'completed' or run['ended_at'] is None):
+            raise RuntimeError(f'Independent completion verification refused: {str(completion)[:200]}')
+    return artifact

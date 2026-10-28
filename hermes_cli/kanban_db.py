@@ -15,6 +15,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -2923,11 +2924,27 @@ def _persist_scratch_completion_artifacts(
     if not isinstance(raw_artifacts, (list, tuple)):
         return
 
+    verification = metadata.get("local_model_verification")
+    verified_artifact_hash = (
+        str(verification.get("artifact_sha256") or "").lower()
+        if isinstance(verification, dict) else ""
+    )
+    if isinstance(verification, dict) and (
+        len(verified_artifact_hash) != 64 or len(raw_artifacts) != 1
+    ):
+        raise ArtifactPreservationError(
+            "verified local-model completion must preserve exactly one artifact with its receipt digest"
+        )
+
     workspace = _scratch_workspace(conn, task_id)
     if workspace is None:
+        if verified_artifact_hash:
+            raise ArtifactPreservationError("verified local-model task has no managed scratch workspace")
         return
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
+        if verified_artifact_hash:
+            raise ArtifactPreservationError("verified local-model artifact is outside managed scratch storage")
         return
 
     try:
@@ -2975,6 +2992,10 @@ def _persist_scratch_completion_artifacts(
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
             _copy_capped(resolved_src, dest, artifact)
+            if verified_artifact_hash and hashlib.sha256(dest.read_bytes()).hexdigest() != verified_artifact_hash:
+                raise ArtifactPreservationError(
+                    "staged local-model artifact digest differs from the independently verified artifact"
+                )
         except Exception as exc:
             if dest is not None:
                 with contextlib.suppress(OSError):

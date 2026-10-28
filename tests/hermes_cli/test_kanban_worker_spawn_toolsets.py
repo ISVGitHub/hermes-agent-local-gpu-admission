@@ -73,7 +73,13 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kbd._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    task = _make_task(kb, assignee="elias")
+    task.body = "Local-GPU-Capability: gemma.fixed-json.v1"
+    task.workspace_kind = "scratch"
+    task.workspace_path = str(workspace)
+    task.completion_contract = "local-only"
+    task.skills = ["local-gpu-model-task-gate"]
+    pid = kbd._default_spawn(task, str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
@@ -81,6 +87,10 @@ agent:
     assert captured["cmd"][-2:] == ["-m", "hermes_cli.kanban_worker_client"]
     assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
     assert captured["env"]["HERMES_KANBAN_CLAIM_LOCK"] == "lock"
+    from hermes_cli.kanban_local_model_scope import task_run_contract_sha256
+
+    assert captured["env"]["HERMES_KANBAN_CAPABILITY_ID"] == "gemma.fixed-json.v1"
+    assert captured["env"]["HERMES_KANBAN_CONTRACT_SHA256"] == task_run_contract_sha256(task)
 
 
 def test_default_spawn_does_not_pass_mutable_launch_overrides(monkeypatch, tmp_path):
@@ -167,7 +177,8 @@ def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tm
     reach a worker whose profile grants ``terminal`` and ``web``."""
     import json
     from contextlib import closing
-    from types import SimpleNamespace
+    from types import ModuleType, SimpleNamespace
+    import sys
 
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
@@ -195,6 +206,12 @@ def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tm
 
     assignee_config = {"model": {"default": "m", "provider": "custom"},
                        "platform_toolsets": {"cli": ["terminal", "web"]}, "toolsets": ["hermes-cli"]}
+    # This test checks the Kanban toolset policy, not gateway model resolution. Importing
+    # gateway.run would load hermes_bootstrap and probe the real checkout recovery marker;
+    # keep that unrelated process bootstrap outside the temporary-home test contract.
+    gateway_run = ModuleType("gateway.run")
+    gateway_run._resolve_gateway_model = lambda _config: "m"
+    monkeypatch.setitem(sys.modules, "gateway.run", gateway_run)
     policy, _ = build_kanban_policy(connection, params, assignee_config)
     assert {"terminal", "web", "kanban"} <= set(policy.toolsets)
 

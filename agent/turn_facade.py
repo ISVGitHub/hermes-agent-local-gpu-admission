@@ -188,6 +188,32 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            # Fixed-JSON Kanban work keeps its lease through trusted artifact
+            # verification and terminal completion in session_kanban.
+            defer_local_gpu_release = bool(getattr(self, "_local_gpu_admission_defer_release", False))
+            local_gpu_lease_ids = (() if defer_local_gpu_release else
+                                   tuple(getattr(self, "_local_gpu_admission_lease_ids", ())))
+            if local_gpu_lease_ids:
+                try:
+                    from hermes_cli.middleware import release_local_gpu_admission_leases
+
+                    local_gpu_scope = dict(getattr(self, "_local_gpu_admission_scope", {}) or {})
+                    if release_local_gpu_admission_leases(
+                        lease_ids=local_gpu_lease_ids, scope=local_gpu_scope,
+                    ):
+                        self._local_gpu_admission_lease_ids = ()
+                        self._local_gpu_admission_scope = {}
+                    else:
+                        logger.error(
+                            "Local GPU lease release failed; controller expiry/reconciliation is required",
+                            extra={"lease_ids": local_gpu_lease_ids,
+                                   "task_run_id": local_gpu_scope.get("task_run_id")},
+                        )
+                except Exception:
+                    logger.error(
+                        "Local GPU lease release failed; controller expiry/reconciliation is required",
+                        exc_info=True,
+                    )
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)
