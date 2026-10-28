@@ -43,6 +43,26 @@ def test_access_failed_aux_falls_back_to_named_main_route():
     assert (second.kwargs.get("model"), second.kwargs.get("provider")) == ("main-model", "main-provider")
 
 
+def test_local_admission_refusal_does_not_fallback_to_main_model():
+    from agent.auxiliary_client import LocalAuxiliaryAdmissionRequired
+
+    compressor = _compressor()
+    refusal = LocalAuxiliaryAdmissionRequired(
+        "Local auxiliary route refused before inference (task=compression); "
+        "this path has no task/run-bound GPU admission"
+    )
+    with patch("agent.conversation_compression._raise_if_stale_attempt"):
+        try:
+            compressor._on_summary_failure(refusal, [], None, "")
+        except LocalAuxiliaryAdmissionRequired as exc:
+            assert "no task/run-bound GPU admission" in str(exc)
+        else:
+            raise AssertionError("admission refusal must stop compression without fallback")
+
+    assert compressor.summary_model == "quota-exhausted-aux"
+    assert compressor._last_summary_error == str(refusal)
+
+
 def test_fallen_back_route_names_main_for_micro_and_never_rides_into_a_pin():
     compressor = _compressor()
     compressor._fallback_to_main_for_compression(_access_error(), "failed")
