@@ -36,6 +36,13 @@ from agent.error_classifier import (
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
+from agent.local_auxiliary_admission import (
+    LocalAuxiliaryAdmissionRequired,
+    _RELAY_AUX_CALL_CONTEXT,
+    record_route_info as _record_route_info,
+    require_nonlocal_auxiliary_route as _require_nonlocal_auxiliary_route,
+    set_relay_auxiliary_route as _set_relay_auxiliary_route,
+)
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
     apply_required_codex_headers as _apply_required_codex_headers,
@@ -78,46 +85,6 @@ class _OpenAIProxy:
 
 
 OpenAI = _OpenAIProxy()
-
-
-class LocalAuxiliaryAdmissionRequired(RuntimeError):
-    """A local auxiliary route has no task/run-bound admission in this call path."""
-
-
-def _require_nonlocal_auxiliary_route(
-    client: Any, provider: str | None, task: str | None, *, base_url: str | None = None,
-) -> None:
-    """Fail closed before auxiliary Relay/provider I/O on any local/private endpoint.
-
-    Auxiliary calls do not carry the primary turn's verified capability and GPU lease. In
-    particular, the auxiliary recovery ladder may retry or switch providers, so admitting a
-    local auxiliary hop from the primary turn's identity would overstate the measured scope.
-    Until that scope is explicitly propagated and revalidated, keep cloud routes unchanged and
-    refuse local hops before Relay or SDK code can send them.
-    """
-    bases = []
-    current = client
-    for _ in range(4):
-        if current is None:
-            break
-        base = str(getattr(current, "base_url", "") or "").strip()
-        if base:
-            bases.append(base)
-        current = getattr(current, "_client", None)
-    base_url = str(base_url or (bases[0] if bases else ""))
-    try:
-        from hermes_cli.middleware import _is_local_llm_route
-
-        local = _is_local_llm_route(provider, base_url)
-    except Exception:
-        # If route classification itself is unavailable, fail closed instead of allowing
-        # an auxiliary request whose endpoint cannot be classified.
-        local = True
-    if local:
-        raise LocalAuxiliaryAdmissionRequired(
-            f"Local auxiliary route refused before inference (task={task or 'call'}); "
-            "this path has no task/run-bound GPU admission"
-        )
 
 
 # Availability probe mode: check_fns only need to know whether a client is RESOLVABLE, so
@@ -2581,11 +2548,6 @@ _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
 
-_RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
-    contextvars.ContextVar("auxiliary_relay_call", default=None)
-)
-
-
 @contextlib.contextmanager
 def _relay_aux_call_scope(args: tuple, kwargs: dict):
     """Bind a fresh relay call context for one auxiliary call; mark it failed on any exception."""
@@ -2624,25 +2586,6 @@ def _relay_auxiliary_call_async(callback):
         with _relay_aux_call_scope(args, kwargs):
             return await callback(*args, **kwargs)
     return wrapped
-
-
-def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode: str | None) -> None:
-    context = _RELAY_AUX_CALL_CONTEXT.get()
-    if context is None:
-        return
-    context["provider"] = str(provider or "auxiliary")
-    context["model"] = str(model or "unknown")
-    context["response_model"] = None
-    context["api_mode"] = str(api_mode or "chat_completions")
-
-
-def _record_route_info(
-    route_info: Optional[dict[str, str]], provider: Optional[str], model: Optional[str]
-) -> None:
-    """Expose the concrete route selected for one auxiliary call."""
-    if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
 
 
 def _relay_auxiliary_metadata(

@@ -111,10 +111,8 @@ plugins:
     ]
     assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
     assert captured["env"]["HERMES_KANBAN_CLAIM_LOCK"] == "lock"
-    from hermes_cli.kanban_local_model_scope import task_run_contract_sha256
-
-    assert captured["env"]["HERMES_KANBAN_CAPABILITY_ID"] == "gemma.fixed-json.v1"
-    assert captured["env"]["HERMES_KANBAN_CONTRACT_SHA256"] == task_run_contract_sha256(task)
+    assert "HERMES_KANBAN_CAPABILITY_ID" not in captured["env"]
+    assert "HERMES_KANBAN_CONTRACT_SHA256" not in captured["env"]
 
 
 def test_default_spawn_does_not_pass_mutable_launch_overrides(monkeypatch, tmp_path):

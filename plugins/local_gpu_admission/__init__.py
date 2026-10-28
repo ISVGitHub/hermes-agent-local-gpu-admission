@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -41,6 +42,7 @@ _VERIFY_FIELDS = (
     "model_override", "provider_override", "completion_contract", "artifacts",
 )
 _MAX_ARTIFACT_BYTES = 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
 
 
 def _unique_object(pairs):
@@ -176,6 +178,7 @@ class ResourceBalancerController:
             return self._block("unsupported_action", "Unsupported admission action")
         except Exception as exc:
             # Never let a callback exception turn into provider fallthrough.
+            _LOGGER.exception("Local GPU admission callback failed (action=%s)", action)
             return self._block("controller_error", f"Local GPU admission refused: {_safe_error_detail(exc)}")
 
     @staticmethod
@@ -255,6 +258,16 @@ class ResourceBalancerController:
         return task
 
     def _load_oracle(self, task, scope):
+        registry_hash, registry_path, capability = self._pinned_capability(scope)
+        self._validate_capability_envelope(capability, scope)
+        live_runtime = self._validate_live_route(capability, task, scope)
+        verifier_hash, verifier_path, fixture_hash, expected = self._load_verifier_oracle(
+            registry_path, capability, task,
+        )
+        return (registry_hash, verifier_hash, verifier_path, fixture_hash,
+                live_runtime, expected, _response_format_for(expected))
+
+    def _pinned_capability(self, scope):
         _rb_root, _state_dir, registry_path = self._configuration()
         registry_bytes = registry_path.read_bytes()
         registry_hash = _sha256(registry_bytes)
@@ -268,7 +281,10 @@ class ResourceBalancerController:
                         if item.get("id") == scope["capability_id"]]
         if len(capabilities) != 1:
             raise ValueError("capability record is missing or ambiguous")
-        capability = capabilities[0]
+        return registry_hash, registry_path, capabilities[0]
+
+    @staticmethod
+    def _validate_capability_envelope(capability, scope):
         route_evidence = capability.get("profile_route_evidence") or {}
         trial_binding = capability.get("trial_binding") or {}
         mapping_review = trial_binding.get("mapping_review") or {}
@@ -289,6 +305,8 @@ class ResourceBalancerController:
                 or scope.get("existing_response_format") != "false"
                 or scope.get("api_call_count") != "1"):
             raise ValueError("fixed-JSON capability requires its first non-streaming, tool-free request")
+
+    def _validate_live_route(self, capability, task, scope):
         runtime = capability.get("observed_runtime") or {}
         expected_digest = str(capability.get("model_digest") or "").lower()
         if len(expected_digest) != 64:
@@ -325,7 +343,10 @@ class ResourceBalancerController:
         if (task.provider_override
                 and task.provider_override.strip().lower() != actual_provider):
             raise ValueError("task provider override differs from the admitted provider")
+        return live_runtime
 
+    @staticmethod
+    def _load_verifier_oracle(registry_path, capability, task):
         verifier_records = []
         one = capability.get("prepared_external_verifier")
         if isinstance(one, dict):
@@ -352,7 +373,7 @@ class ResourceBalancerController:
         # The expected object is an oracle for completion verification only. Never require or
         # inject it into the task body: doing so leaks the answer to the model and makes the
         # capability canary measure copying rather than task performance.
-        return registry_hash, verifier_hash, verifier_path, fixture_hash, live_runtime, expected, _response_format_for(expected)
+        return verifier_hash, verifier_path, fixture_hash, expected
 
     @staticmethod
     def _live_model_evidence(scope: dict[str, str]) -> dict[str, str]:
@@ -499,6 +520,7 @@ class ResourceBalancerController:
                 "response_format": response_format,
             }
         except Exception as exc:
+            _LOGGER.exception("Local GPU admission acquire refused")
             return self._block("acquire_refused", f"Admission refused: {_safe_error_detail(exc)}")
 
     def _validate(self, context: dict[str, Any], lease_ids: tuple[str, ...]) -> dict[str, Any]:
@@ -533,6 +555,7 @@ class ResourceBalancerController:
                 raise ValueError("model digest, quantization, or runtime version changed during run")
             self._resource_balancer_status(state_dir, lease.job_id)
         except Exception as exc:
+            _LOGGER.exception("Local GPU admission lease validation refused")
             return self._block("lease_validation_refused", f"Lease validation refused: {_safe_error_detail(exc)}")
         return {
             "decision": "allow", "policy_id": "local-gpu-task-capability-v1",
@@ -554,6 +577,7 @@ class ResourceBalancerController:
             if lease.manager is not None:
                 lease.manager.__exit__(None, None, None)
         except Exception:
+            _LOGGER.exception("Local GPU admission lease release failed")
             return self._block("release_failed", "Resource Balancer lease release failed")
         return {"decision": "released", "lease_ids": [lease.job_id], "scope": scope}
 
@@ -617,6 +641,7 @@ class ResourceBalancerController:
             _run_pinned_verifier(lease.verifier_path, artifact)
             self._resource_balancer_status(state_dir, lease.job_id)
         except Exception as exc:
+            _LOGGER.exception("Local GPU admission completion verification failed")
             return self._block(
                 "completion_verification_failed",
                 f"Independent verification failed: {_safe_error_detail(exc)}",

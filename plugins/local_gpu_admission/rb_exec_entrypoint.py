@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
 import sys
 import time
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _scope_contains_unit(scope_unit: str, cgroup_text: str) -> bool:
@@ -98,7 +101,7 @@ def _task_is_still_claimed(db_path: str, context: dict[str, str], pid: int,
             kb._append_event(write_conn, task.id, "worker_registered",
                              {"pid": pid, "started_at": started_at}, run_id=int(context["run_id"]))
             write_conn.commit()
-        except Exception:
+        except (OSError, sqlite3.Error, TypeError, ValueError):
             write_conn.rollback()
             return False
     return True
@@ -127,6 +130,16 @@ def _bind_context(state_dir: str, job_id: str, context: dict[str, str]) -> None:
             )
     finally:
         conn.close()
+
+
+def _worker_exec_env(job_id: str) -> dict[str, str]:
+    from tools.environments.local import served_profile_child_env
+
+    env = served_profile_child_env(
+        base=os.environ, target_home=os.environ.get("HERMES_HOME"), inherit_credentials=True,
+    )
+    env["RESOURCE_BALANCER_ADMISSION_JOB_ID"] = str(job_id)
+    return env
 
 
 def main(argv=None) -> int:
@@ -160,10 +173,10 @@ def main(argv=None) -> int:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("dispatcher did not bind this PID to the claimed task/run")
                 time.sleep(0.05)
-            env = os.environ.copy()
-            env["RESOURCE_BALANCER_ADMISSION_JOB_ID"] = str(job_id)
+            env = _worker_exec_env(str(job_id))
             os.execvpe(command[0], command, env)
     except Exception as exc:
+        _LOGGER.exception("Local GPU worker dispatch refused before exec")
         print(f"Local GPU dispatch refused before worker exec: {exc}", file=sys.stderr)
         return 75
     return 127

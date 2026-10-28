@@ -266,10 +266,13 @@ def test_admission_lifecycle_reads_task_verifies_artifact_and_releases_lease(tmp
         "kanban_db": "HERMES_KANBAN_DB",
         "kanban_workspace": "HERMES_KANBAN_WORKSPACE",
         "kanban_claim_lock": "HERMES_KANBAN_CLAIM_LOCK",
-        "capability_id": "HERMES_KANBAN_CAPABILITY_ID",
-        "task_contract_sha256": "HERMES_KANBAN_CONTRACT_SHA256",
     }.items():
         monkeypatch.setenv(env_key, str(scope[key]))
+    from agent.delegation_context import set_owned_local_gpu_task_context
+    set_owned_local_gpu_task_context({
+        "capability_id": scope["capability_id"],
+        "task_contract_sha256": scope["task_contract_sha256"],
+    })
     fake_provider_requests = []
     fake_provider_response = expected_bytes.decode("utf-8")
     monkeypatch.setattr(helpers, "should_use_direct_api_call", lambda _agent: True)

@@ -288,10 +288,10 @@ def test_interruptible_provider_adapter_validates_and_forwards_admitted_schema(m
         "HERMES_KANBAN_TASK": "task-1", "HERMES_KANBAN_RUN_ID": "7",
         "HERMES_KANBAN_BOARD": "board", "HERMES_KANBAN_DB": "/tmp/board.sqlite3",
         "HERMES_KANBAN_WORKSPACE": "/tmp/workspace", "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
-        "HERMES_KANBAN_CAPABILITY_ID": "capability-1",
-        "HERMES_KANBAN_CONTRACT_SHA256": "a" * 64,
     }.items():
         monkeypatch.setenv(key, value)
+    from agent.delegation_context import set_owned_local_gpu_task_context
+    set_owned_local_gpu_task_context({"capability_id": "capability-1", "task_contract_sha256": "a" * 64})
     agent = SimpleNamespace(
         provider="ollama", base_url="http://127.0.0.1:11434/v1/", model="fixture-model",
         session_id="session-1", api_mode="chat_completions", _api_call_count=1,
@@ -322,10 +322,10 @@ def test_resource_balancer_block_reason_stops_provider_adapter_before_io(monkeyp
         "HERMES_KANBAN_DB": "/tmp/kanban.sqlite3",
         "HERMES_KANBAN_WORKSPACE": "/tmp/workspace",
         "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
-        "HERMES_KANBAN_CAPABILITY_ID": "capability-1",
-        "HERMES_KANBAN_CONTRACT_SHA256": "a" * 64,
     }.items():
         monkeypatch.setenv(key, value)
+    from agent.delegation_context import set_owned_local_gpu_task_context
+    set_owned_local_gpu_task_context({"capability_id": "capability-1", "task_contract_sha256": "a" * 64})
 
     def blocked(**_kwargs):
         return {
@@ -370,8 +370,95 @@ def test_local_streaming_call_stops_before_provider_io_without_task_identity(mon
     [
         ("ollama", "https://remote.example/v1", True),
         ("openai", "http://192.168.1.10:8000/v1", True),
-        ("openai", "https://api.example/v1", False),
+        ("openai", "https://api.openai.com/v1", False),
     ],
 )
 def test_local_route_classifier(provider, base_url, expected):
     assert _is_local_llm_route(provider, base_url) is expected
+
+
+def test_official_provider_through_loopback_proxy_is_local_route(monkeypatch):
+    from hermes_cli import local_model_routes
+
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:8080")
+
+    assert local_model_routes.is_local_llm_route(
+        "openai", "https://api.openai.com/v1",
+    ) is True
+
+
+def test_official_provider_bypassing_proxy_stays_remote(monkeypatch):
+    from hermes_cli import local_model_routes
+
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("NO_PROXY", "api.openai.com")
+    monkeypatch.setenv("no_proxy", "api.openai.com")
+
+    assert local_model_routes.is_local_llm_route(
+        "openai", "https://api.openai.com/v1",
+    ) is False
+
+
+def test_custom_fqdn_resolving_to_private_address_requires_local_admission(monkeypatch):
+    from hermes_cli import local_model_routes
+
+    monkeypatch.setattr(local_model_routes, "_is_known_official_provider_host", lambda *_args: False)
+    monkeypatch.setattr(local_model_routes, "_host_resolves_to_local_address", lambda _host: True)
+
+    assert _is_local_llm_route("openai", "https://gpu.region.example/v1") is True
+
+
+def test_unresolvable_custom_fqdn_fails_closed_as_local_route(monkeypatch):
+    from hermes_cli import local_model_routes
+
+    monkeypatch.setattr(local_model_routes, "_is_known_official_provider_host", lambda *_args: False)
+    monkeypatch.setattr(local_model_routes, "_host_resolves_to_local_address", lambda _host: True)
+
+    assert _is_local_llm_route("custom", "https://unknown.example/v1") is True
+
+
+@pytest.mark.parametrize(
+    "resolved,expected",
+    [
+        ([(2, 1, 6, "", ("10.4.5.6", 0))], True),
+        ([(2, 1, 6, "", ("8.8.8.8", 0))], False),
+        (OSError("resolver unavailable"), True),
+    ],
+)
+def test_custom_hostname_resolution_is_private_or_fail_closed(monkeypatch, resolved, expected):
+    from hermes_cli import local_model_routes
+
+    monkeypatch.setattr(local_model_routes, "_is_known_official_provider_host", lambda *_args: False)
+    if isinstance(resolved, BaseException):
+        def fail_lookup(*_args, **_kwargs):
+            raise resolved
+        monkeypatch.setattr(local_model_routes.socket, "getaddrinfo", fail_lookup)
+    else:
+        monkeypatch.setattr(local_model_routes.socket, "getaddrinfo", lambda *_args, **_kwargs: resolved)
+
+    assert local_model_routes._host_resolves_to_local_address("gpu.region.example") is expected
+
+
+def test_custom_hostname_resolution_timeout_fails_closed(monkeypatch):
+    from hermes_cli import local_model_routes
+
+    monkeypatch.setattr(local_model_routes, "_LOCAL_ROUTE_DNS_TIMEOUT_SECONDS", 0.001)
+    original_thread = local_model_routes.threading.Thread
+
+    class StalledThread:
+        def __init__(self, *, target, **kwargs):
+            self._target = target
+            self._thread = original_thread(target=target, **kwargs)
+
+        def start(self):
+            # Do not start resolver work: this deterministically exercises the wait timeout.
+            return None
+
+    monkeypatch.setattr(local_model_routes.threading, "Thread", StalledThread)
+
+    assert local_model_routes._host_resolves_to_local_address("slow.example") is True

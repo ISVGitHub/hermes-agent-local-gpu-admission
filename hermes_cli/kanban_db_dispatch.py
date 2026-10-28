@@ -2059,149 +2059,26 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 
 
 def _dispatch_lane_task(
-    conn: sqlite3.Connection,
-    row: sqlite3.Row,
-    assignee: str,
-    result: DispatchResult,
-    *,
-    lane: str,
-    dry_run: bool,
-    ttl_seconds: Optional[int],
-    board: Optional[str],
-    failure_limit: int,
-    spawn_fn,
-    per_profile_cap: Optional[int],
+    conn: sqlite3.Connection, row: sqlite3.Row, assignee: str, result: DispatchResult, *,
+    lane: str, dry_run: bool, ttl_seconds: Optional[int], board: Optional[str],
+    failure_limit: int, spawn_fn, per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
-    """Guard, claim, resolve the workspace and spawn one ready/review row.
-    Returns True when a spawn slot was consumed (real or ``dry_run``); every
-    skip is recorded on ``result``.
-    """
-    task_id = row["id"]
-    # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
-    # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
-    # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
-    # it by assigning a profile, and health telemetry suppresses "stuck" for it.
-    profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
-        result.skipped_nonspawnable.append(task_id)
-        # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
-        # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
-        # condition never expires on its own, so write it once: a repeat only when something
-        # else happened on the card since (reassign, comment) — not one row per tick forever,
-        # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
-        return False
-    # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
-        current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
-            return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
-    if guard_reason is not None:
-        result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
-        if not dry_run:
-            with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
-        return False
+    from hermes_cli.kanban_dispatch_lane import dispatch_lane_task
 
-    if not dry_run:
-        admission_reason = _local_gpu_dispatch_preflight(row, assignee)
-        if admission_reason:
-            result.skipped_local_admission.append((task_id, admission_reason))
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind,payload FROM task_events WHERE task_id=? "
-                    "ORDER BY created_at DESC,id DESC LIMIT 1", (task_id,),
-                ).fetchone()
-                payload = {"assignee": assignee, "reason": admission_reason}
-                if (last is None or last["kind"] != "local_gpu_admission_refused"
-                        or last["payload"] != _kb._json_or_null(payload)):
-                    _kb._append_event(conn, task_id, "local_gpu_admission_refused", payload)
-            return False
-
-    def _count_spawn(name: str) -> None:
-        # Later rows in this tick respect the per-profile cap; subsequent
-        # ticks re-query from the DB.
-        if per_profile_cap is not None and name:
-            per_profile_running[name] = per_profile_running.get(name, 0) + 1
-
-    if dry_run:
-        result.spawned.append((task_id, assignee, ""))
-        _count_spawn(assignee)
-        return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
-    if claimed is None:
-        return False
-    try:
-        resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    # Keep the in-memory Task handed to the worker-spawn boundary in sync with the
-    # persisted run contract; scratch workspace rows start with workspace_path=NULL.
-    claimed.workspace_path = str(workspace)
-    if claimed.workspace_kind == "worktree":
-        claimed.branch_name = resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
-        _kbw.set_branch_name(conn, claimed.id, claimed.branch_name)
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
-        return True
-    except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
-        if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
+    return dispatch_lane_task(
+        conn, row, assignee, result, lane=lane, dry_run=dry_run,
+        ttl_seconds=ttl_seconds, board=board, failure_limit=failure_limit,
+        spawn_fn=spawn_fn, per_profile_cap=per_profile_cap,
+        per_profile_running=per_profile_running, deps={
+            "profile_exists_fn": _profile_exists_fn,
+            "check_respawn_guard": check_respawn_guard,
+            "local_gpu_dispatch_preflight": _local_gpu_dispatch_preflight,
+            "kb": _kb, "kbw": _kbw, "call_spawn_fn": _call_spawn_fn,
+            "default_spawn": _default_spawn, "set_worker_pid": _set_worker_pid,
+            "record_task_failure": _record_task_failure,
+        },
+    )
 
 
 def _apply_default_assignee(
@@ -2668,159 +2545,15 @@ def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
 
 
 def _local_gpu_dispatch_preflight(row: sqlite3.Row, assignee: str) -> Optional[str]:
-    """Fail closed on every effective local-model route before the task is claimed.
+    from hermes_cli.local_gpu_dispatch_preflight import local_gpu_dispatch_preflight
 
-    The capability registry, profile route and live runtime are read-only here.
-    The task remains unclaimed when any evidence is absent or mismatched. This
-    check complements the later worker-bound RB lease; it does not replace it.
-    """
-    from hermes_cli.kanban_local_model_scope import capability_id_from_body
-
-    capability_id = capability_id_from_body(row["body"])
-    try:
-        from hermes_cli.profiles import resolve_profile_env
-        profile_home = resolve_profile_env(assignee)
-        if not profile_home:
-            return "assigned profile configuration is unavailable"
-        with _worker_profile_scope(profile_home):
-            from hermes_cli.config import load_config_readonly
-            config = load_config_readonly() or {}
-        model_cfg = config.get("model") or {}
-        provider = str(row["provider_override"] or model_cfg.get("provider") or "").strip().lower()
-        model = str(row["model_override"] or model_cfg.get("default") or "").strip()
-        provider_cfg = (config.get("providers") or {}).get(provider) or {}
-        base_url = str(provider_cfg.get("base_url") or model_cfg.get("base_url") or "").strip()
-        parsed = urlsplit(base_url)
-        local_provider = provider in {"ollama", "vllm", "llamacpp", "lmstudio", "local"}
-        loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-        is_local = local_provider or loopback
-        if not is_local and not capability_id:
-            return None
-        if not capability_id:
-            return "effective profile route is local but task has no Local-GPU-Capability marker"
-        if not is_local:
-            return "capability-marked task resolves to a non-local provider route"
-
-        plugins_cfg = config.get("plugins") or {}
-        entry = (plugins_cfg.get("entries") or {}).get("local_gpu_admission") or {}
-        settings = entry.get("settings") or {}
-        if entry.get("enabled") is not True:
-            return "profile local_gpu_admission gate is not enabled"
-        registry_path = Path(str(settings.get("capability_registry_path") or "")).expanduser().resolve(strict=True)
-        registry_bytes = registry_path.read_bytes()
-        registry_hash = hashlib.sha256(registry_bytes).hexdigest()
-        if registry_hash != str(settings.get("capability_registry_sha256") or "").lower():
-            return "capability registry digest differs from profile pin"
-        registry = json.loads(registry_bytes.decode("utf-8"))
-        capabilities = [item for item in registry.get("capabilities", [])
-                        if isinstance(item, dict) and item.get("id") == capability_id]
-        if len(capabilities) != 1:
-            return "capability ID is missing or duplicated in the pinned registry"
-        capability = capabilities[0]
-        if capability.get("allow") is not True:
-            return "pinned capability is not authorized (allow is false)"
-        trial_binding = capability.get("trial_binding") or {}
-        route_evidence = capability.get("profile_route_evidence") or {}
-        mapping_review = trial_binding.get("mapping_review") or {}
-        if (trial_binding.get("admission_capability_id") != capability_id
-                or not trial_binding.get("trial_task_class")
-                or trial_binding.get("trial_task_class") != route_evidence.get("task_class")
-                or mapping_review.get("status") != "approved"
-                or not str(mapping_review.get("reviewer") or "").strip()
-                or not str(mapping_review.get("reviewed_at_utc") or "").strip()):
-            return "trial task-class mapping is missing or not independently reviewed"
-        if (not str(capability.get("status") or "").startswith("narrowly_supported")
-                or capability.get("request_schema_policy") != "json_schema_from_fixture_types_v1"):
-            return "capability status or response-schema policy is outside the supported envelope"
-
-        runtime = capability.get("observed_runtime") or {}
-        expected_profile = str(runtime.get("profile") or "")
-        if Path(profile_home).name != expected_profile:
-            return "assigned profile differs from the experimentally measured profile"
-        if model != capability.get("model_tag") or provider != str(runtime.get("backend") or "").lower():
-            return "task model/provider differs from the pinned capability route"
-        if (int(model_cfg.get("ollama_num_ctx") or 0) != int(runtime.get("ollama_num_ctx") or 0)
-                or int(model_cfg.get("context_length") or 0) != int(runtime.get("context_length") or 0)):
-            return "configured request context is absent or differs from the measured context"
-        route = {
-            "profile": expected_profile,
-            "profile_default_model": model_cfg.get("default"),
-            "provider": model_cfg.get("provider"),
-            "ollama_num_ctx": model_cfg.get("ollama_num_ctx"),
-            "api_base": provider_cfg.get("base_url"),
-        }
-        route_hash = hashlib.sha256(json.dumps(
-            route, sort_keys=True, separators=(",", ":"),
-        ).encode()).hexdigest()
-        if route_hash != runtime.get("profile_route_sha256"):
-            return "profile route settings differ from the measured route hash"
-        expected_url = urlsplit(str(runtime.get("base_url") or ""))
-        if ((parsed.scheme, parsed.hostname, parsed.port, parsed.path.rstrip("/"))
-                != (expected_url.scheme, expected_url.hostname, expected_url.port, expected_url.path.rstrip("/"))):
-            return "effective local endpoint differs from the measured route"
-
-        verifier = capability.get("prepared_external_verifier") or {}
-        if verifier.get("task_id") != row["id"]:
-            return "pinned capability has no verifier for this exact task"
-        if verifier.get("state") in ("prepared_not_executed", "missing", "rejected"):
-            return "task-specific independent verifier has not passed its trial"
-        root = registry_path.parent.resolve(strict=True)
-        for path_key, hash_key in (("verifier_path", "verifier_sha256"),
-                                   ("expected_fixture_path", "expected_fixture_sha256")):
-            asset = (root / str(verifier.get(path_key) or "")).resolve(strict=True)
-            if not asset.is_relative_to(root) or hashlib.sha256(asset.read_bytes()).hexdigest() != verifier.get(hash_key):
-                return "pinned verifier or expected fixture digest mismatch"
-
-        if provider != "ollama" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            return "only the measured loopback Ollama route is supported by this preflight"
-        tags_url = f"{parsed.scheme}://{parsed.netloc}/api/tags"
-        with urlopen(tags_url, timeout=2) as response:
-            tags = json.loads(response.read(1024 * 1024 + 1).decode("utf-8"))
-        matches = [item for item in tags.get("models", []) if item.get("name") == model]
-        if len(matches) != 1 or matches[0].get("digest") != capability.get("model_digest"):
-            return "installed model digest differs from the proven capability digest"
-        details = matches[0].get("details") or {}
-        if str(details.get("quantization_level") or "").upper() != str(runtime.get("quantization") or "").upper():
-            return "installed model quantization differs from the proven capability"
-        with urlopen(f"{parsed.scheme}://{parsed.netloc}/api/version", timeout=2) as response:
-            version = json.loads(response.read(64 * 1024 + 1).decode("utf-8"))
-        if version.get("version") != runtime.get("runtime_version"):
-            return "Ollama runtime version differs from the proven capability"
-
-        state_dir = Path(str(settings.get("resource_balancer_state_dir") or "")).expanduser().resolve(strict=True)
-        conn = sqlite3.connect((state_dir / "queue.sqlite3").as_uri() + "?mode=ro", uri=True, timeout=1)
-        conn.row_factory = sqlite3.Row
-        try:
-            state_row = conn.execute("SELECT data FROM controller WHERE id=1").fetchone()
-            if state_row is None:
-                return "Resource Balancer has no current controller status"
-            state = json.loads(state_row["data"])
-            active = conn.execute(
-                "SELECT 1 FROM jobs WHERE class IN ('gpu','mixed') "
-                "AND state IN ('starting','running') LIMIT 1",
-            ).fetchone()
-        finally:
-            conn.close()
-        if (state.get("mode") != "manage" or state.get("blocked") is not False
-                or time.time() - float(state.get("updated") or 0) > 30
-                or (state.get("resource_gates") or {}).get("gpu", {}).get("blocked") is not False):
-            return "Resource Balancer is stale, globally blocked, or GPU-gated"
-        if active is not None:
-            return "another cooperating GPU reservation is already active"
-        return None
-    except Exception as exc:
-        if not capability_id:
-            # Legacy/non-capability rows may use profiles in control-plane
-            # test and remote-dispatch environments where no profile config
-            # is available to this dispatcher. Their model middleware still
-            # denies local provider I/O without an admitted task/run lease.
-            return None
-        detail = " ".join(str(exc).split())[:180]
-        return f"local GPU dispatcher preflight failed closed: {detail or type(exc).__name__}"
-
+    return local_gpu_dispatch_preflight(
+        row, assignee, worker_profile_scope=_worker_profile_scope,
+        urlopen_fn=urlopen, now=time.time,
+    )
 
 def _wrap_capability_worker_with_gpu_reservation(
-    task: "Task", command: list[str], *, profile_home: Optional[str], env: dict[str, str], board: Optional[str],
+    task: Task, command: list[str], *, profile_home: Optional[str], env: dict[str, str], board: Optional[str],
 ) -> list[str]:
     """Put an explicitly local-capability worker behind a pre-exec RB lease.
 
@@ -3063,20 +2796,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
-    # Local-model admission binds the capability declaration and full contract to this
-    # exact dispatcher-owned task/run. These values are hints only: the controller must
-    # read the pinned DB row and recompute the digest before acquiring a GPU lease.
-    from hermes_cli.kanban_local_model_scope import capability_id_from_body, task_run_contract_sha256
-    capability_id = capability_id_from_body(task.body)
-    if capability_id:
-        env["HERMES_KANBAN_CAPABILITY_ID"] = capability_id
-        try:
-            env["HERMES_KANBAN_CONTRACT_SHA256"] = task_run_contract_sha256(task)
-        except ValueError:
-            env.pop("HERMES_KANBAN_CONTRACT_SHA256", None)
-    else:
-        env.pop("HERMES_KANBAN_CAPABILITY_ID", None)
-        env.pop("HERMES_KANBAN_CONTRACT_SHA256", None)
+    # Capability identity is bound by the trusted gateway session after it resolves
+    # the dispatcher-owned task/run from the claim database. Never pass declarations
+    # or a precomputed digest through the mutable worker environment.
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:

@@ -132,6 +132,23 @@ def main():
             try:
                 with closing(connect(board='owned')) as conn:
                     launched = dispatch.dispatch_once(conn, board='owned', max_spawn=1)
+                    if peer.mode == 'local-proxy-refusal':
+                        assert not launched.spawned, launched
+                        assert launched.skipped_local_admission == [(
+                            tid, 'effective profile route is local but task has no Local-GPU-Capability marker',
+                        )], launched
+                        task = kb.get_task(conn, tid)
+                        receipt.update(
+                            task_status=task.status,
+                            current_run_id=task.current_run_id,
+                            claim_lock=task.claim_lock,
+                            spawned=len(launched.spawned),
+                            skipped_local_admission=launched.skipped_local_admission,
+                            provider_requests=len(peer.requests),
+                        )
+                        assert task.status == 'ready' and task.current_run_id is None and task.claim_lock is None
+                        assert not clients and not peer.requests
+                        return
                     assert [s[0] for s in launched.spawned] == [tid], launched
                     task = kb.get_task(conn, tid)
                     params = dict(task_id=tid, board='owned', run_id=task.current_run_id, claim_lock=task.claim_lock)

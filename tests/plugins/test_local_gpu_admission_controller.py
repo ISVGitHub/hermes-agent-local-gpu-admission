@@ -378,10 +378,10 @@ def test_bundled_plugin_registers_admission_in_an_isolated_profile(tmp_path, mon
         "HERMES_KANBAN_TASK": "task-1", "HERMES_KANBAN_RUN_ID": "1",
         "HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_DB": str(tmp_path / "missing.db"),
         "HERMES_KANBAN_WORKSPACE": str(tmp_path), "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
-        "HERMES_KANBAN_CAPABILITY_ID": "fixed-json.v1",
-        "HERMES_KANBAN_CONTRACT_SHA256": "a" * 64,
     }.items():
         monkeypatch.setenv(key, value)
+    from agent.delegation_context import set_owned_local_gpu_task_context
+    set_owned_local_gpu_task_context({"capability_id": "fixed-json.v1", "task_contract_sha256": "a" * 64})
     provider_calls = []
     monkeypatch.setattr(helpers, "direct_api_call", lambda *_args, **_kwargs: provider_calls.append("called"))
     agent = SimpleNamespace(

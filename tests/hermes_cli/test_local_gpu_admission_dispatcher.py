@@ -208,6 +208,28 @@ def test_dispatch_preflight_ignores_explicit_remote_task(monkeypatch, tmp_path):
     assert dispatcher._local_gpu_dispatch_preflight(row, "remote-profile") is None
 
 
+def test_dispatch_preflight_refuses_custom_fqdn_that_resolves_private(monkeypatch, tmp_path):
+    from hermes_cli import local_model_routes
+
+    profile_home = tmp_path / "custom-private-fqdn"
+    profile_home.mkdir()
+    config = {
+        "model": {"provider": "custom", "default": "local-model"},
+        "providers": {"custom": {"base_url": "https://gpu.region.example/v1"}},
+    }
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _name: str(profile_home))
+    monkeypatch.setattr(dispatcher, "_worker_profile_scope", lambda *_a, **_k: nullcontext())
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr(local_model_routes, "_is_known_official_provider_host", lambda *_args: False)
+    monkeypatch.setattr(local_model_routes, "_host_resolves_to_local_address", lambda _host: True)
+    row = {"id": "task-private-fqdn", "body": "ordinary task", "model_override": None,
+           "provider_override": None}
+
+    reason = dispatcher._local_gpu_dispatch_preflight(row, "custom-private-fqdn")
+
+    assert reason == "effective profile route is local but task has no Local-GPU-Capability marker"
+
+
 def test_dispatch_refusal_persists_reason_without_claim_or_spawn(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile_home = root / "profiles" / "local-profile"
@@ -218,7 +240,7 @@ def test_dispatch_refusal_persists_reason_without_claim_or_spawn(monkeypatch, tm
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
-    db_path = kb.init_db()
+    kb.init_db()
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps({"capabilities": [{"id": "cap-1", "allow": False}]}),
                              encoding="utf-8")

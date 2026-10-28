@@ -747,13 +747,15 @@ def _handle_complete(args: dict, **kw) -> str:
         task = kb.get_task(conn, tid)
         task_body = (task.body or "") if task else ""
         capability_declared = "Local-GPU-Capability:" in task_body
-        worker_capability = os.environ.get("HERMES_KANBAN_CAPABILITY_ID", "")
+        from agent.delegation_context import owned_local_gpu_task_context
+        local_task_context = owned_local_gpu_task_context()
+        worker_capability = local_task_context.get("capability_id", "")
         if capability_declared or worker_capability:
             from hermes_cli.kanban_local_model_scope import capability_id_from_body, task_run_contract_sha256
 
             capability_id = capability_id_from_body(task_body)
             run_id = _worker_run_id(tid)
-            contract_digest = os.environ.get("HERMES_KANBAN_CONTRACT_SHA256", "")
+            contract_digest = local_task_context.get("task_contract_sha256", "")
             _check(capability_id and worker_capability == capability_id,
                    "local task completion refused: capability declaration is missing or mismatched")
             _check(task is not None and run_id is not None and task.current_run_id == run_id,
@@ -782,6 +784,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     artifacts=(metadata or {}).get("artifacts", []),
                 )
             except Exception as exc:
+                logger.exception("Local GPU task completion verification failed")
                 raise _Reject(f"local task completion refused: {exc}") from None
             metadata = {**(metadata or {}), "local_model_verification": verification}
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())

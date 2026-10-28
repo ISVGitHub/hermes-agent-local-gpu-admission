@@ -10,7 +10,6 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import json
 import logging
 import math
@@ -32,6 +31,7 @@ from agent.error_classifier import (
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
+from agent.chat_completion_thread_context import context_thread_target as _context_thread_target
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
@@ -73,12 +73,6 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
 # double traffic every attempt, while later turns re-arm automatically.
 _STREAM_5XX_PROBE_WINDOW_S = 60.0
-
-
-def _context_thread_target(callback):
-    """Bind a no-argument thread target to the caller's ContextVars."""
-    context = contextvars.copy_context()
-    return lambda: context.run(callback)
 
 
 def _join_worker_for_relay_teardown(worker, *, label: str) -> None:

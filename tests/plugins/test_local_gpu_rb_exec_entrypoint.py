@@ -4,7 +4,31 @@ import sqlite3
 
 import pytest
 
-from plugins.local_gpu_admission.rb_exec_entrypoint import _bind_context, _scope_contains_unit, _task_is_still_claimed
+from plugins.local_gpu_admission.rb_exec_entrypoint import (
+    _bind_context, _scope_contains_unit, _task_is_still_claimed, _worker_exec_env,
+)
+
+
+def test_worker_exec_env_uses_served_profile_scope(monkeypatch, tmp_path):
+    from tools.environments import local
+
+    home = tmp_path / "served-profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+    calls = {}
+
+    def build_env(*, base, target_home, inherit_credentials):
+        calls.update(target_home=target_home, inherit_credentials=inherit_credentials)
+        return {"HERMES_HOME": str(target_home), "HERMES_KANBAN_TASK": base["HERMES_KANBAN_TASK"]}
+
+    monkeypatch.setattr(local, "served_profile_child_env", build_env)
+    env = _worker_exec_env("rb-job-1")
+
+    assert calls == {"target_home": str(home), "inherit_credentials": True}
+    assert env == {
+        "HERMES_HOME": str(home), "HERMES_KANBAN_TASK": "task-1",
+        "RESOURCE_BALANCER_ADMISSION_JOB_ID": "rb-job-1",
+    }
 
 
 def test_bind_context_persists_only_to_an_active_gpu_reservation(tmp_path):

@@ -175,10 +175,8 @@ def test_local_json_worker_verifies_and_completes_before_lease_release(tmp_path,
     monkeypatch.setenv('HERMES_KANBAN_BOARD', 'local')
     monkeypatch.setenv('HERMES_KANBAN_CLAIM_LOCK', task.claim_lock)
     monkeypatch.setenv('HERMES_KANBAN_WORKSPACE', str(workspace))
-    monkeypatch.setenv('HERMES_KANBAN_CAPABILITY_ID', 'fixed-json.v1')
-    monkeypatch.setenv('HERMES_KANBAN_CONTRACT_SHA256',
-                       __import__('hermes_cli.kanban_local_model_scope', fromlist=['task_run_contract_sha256'])
-                       .task_run_contract_sha256(task))
+    monkeypatch.delenv('HERMES_KANBAN_CAPABILITY_ID', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_CONTRACT_SHA256', raising=False)
     monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt',
                         lambda *_args, **_kwargs: ('', ['local-gpu-model-task-gate'], []))
     monkeypatch.setattr('agent.kanban_turn_recovery.recover_failed_kanban_turns',
@@ -237,6 +235,9 @@ def test_local_json_worker_verifies_and_completes_before_lease_release(tmp_path,
     monkeypatch.setattr('hermes_cli.middleware.release_local_gpu_admission_leases', release)
     context = {
         'capability_id': 'fixed-json.v1', 'skills': ['local-gpu-model-task-gate'],
+        'task_contract_sha256': __import__(
+            'hermes_cli.kanban_local_model_scope', fromlist=['task_run_contract_sha256']
+        ).task_run_contract_sha256(task),
         'context': '', 'task_id': task.id, 'run_id': task.current_run_id,
         'claim_lock': task.claim_lock, 'board': 'local', 'db': str(db_path),
         'workspace': str(workspace), 'goal_mode': False,
@@ -245,30 +246,27 @@ def test_local_json_worker_verifies_and_completes_before_lease_release(tmp_path,
     assert result['completed'] is True
     assert len(verifier_calls) == 1
     assert len(release_observations) == 1
+    from agent.delegation_context import owned_local_gpu_task_context
+    assert owned_local_gpu_task_context() == {}
 
 
-@pytest.mark.parametrize('mode', ['complete', 'timeout', 'rate_limit', 'billing', 'crash'])
-def test_real_dispatcher_lifecycle(tmp_path, mode):
+def test_real_dispatcher_refuses_local_proxy_without_capability(tmp_path):
     import os
     import subprocess
     import sys
     repo = Path(__file__).resolve().parents[2]
     from tests.gateway.fixtures.local_recovery_probe import child_env
     env = child_env()
-    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode)
+    env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE='local-proxy-refusal')
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads((tmp_path / 'state' / 'receipt.json').read_text())
     print(json.dumps(receipt))
-    if mode != 'complete':
-        assert receipt['task_status'] == 'ready'
-        return
-    assert receipt['task_status'] == 'done' and receipt['source'] == 'kanban'
-    assert receipt['tools'] and receipt['task_context'] and receipt['skill_context'] and receipt['hook_effect']
-    assert receipt['admissions'] == 1 and receipt['retry_same_session']
-    assert receipt['goal_continuation'] and receipt['stable_prefix']
-    print(json.dumps(receipt))
+    assert receipt['task_status'] == 'ready'
+    assert receipt['current_run_id'] is None and receipt['claim_lock'] is None
+    assert receipt['spawned'] == 0 and receipt['provider_requests'] == 0
+    assert receipt['skipped_local_admission']
 
 
 def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):

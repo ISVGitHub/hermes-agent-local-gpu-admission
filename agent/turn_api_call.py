@@ -128,6 +128,8 @@ def perform_api_call(
 
     from hermes_cli.middleware import run_llm_admission_middleware, run_llm_execution_middleware
 
+    from agent.delegation_context import owned_local_gpu_task_context
+    local_task_context = owned_local_gpu_task_context()
     admission = run_llm_admission_middleware(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         kanban_task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
@@ -136,8 +138,8 @@ def perform_api_call(
         kanban_db=os.environ.get("HERMES_KANBAN_DB", ""),
         kanban_workspace=os.environ.get("HERMES_KANBAN_WORKSPACE", ""),
         kanban_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK", ""),
-        capability_id=os.environ.get("HERMES_KANBAN_CAPABILITY_ID", ""),
-        task_contract_sha256=os.environ.get("HERMES_KANBAN_CONTRACT_SHA256", ""),
+        capability_id=local_task_context.get("capability_id", ""),
+        task_contract_sha256=local_task_context.get("task_contract_sha256", ""),
         context_length=getattr(getattr(agent, "context_compressor", None), "context_length", 0),
         ollama_num_ctx=getattr(agent, "_ollama_num_ctx", 0),
         session_id=agent.session_id or "", model=agent.model, provider=agent.provider,
@@ -184,8 +186,8 @@ def perform_api_call(
         "kanban_db": os.environ.get("HERMES_KANBAN_DB", ""),
         "kanban_workspace": os.environ.get("HERMES_KANBAN_WORKSPACE", ""),
         "kanban_claim_lock": os.environ.get("HERMES_KANBAN_CLAIM_LOCK", ""),
-        "capability_id": os.environ.get("HERMES_KANBAN_CAPABILITY_ID", ""),
-        "task_contract_sha256": os.environ.get("HERMES_KANBAN_CONTRACT_SHA256", ""),
+        "capability_id": local_task_context.get("capability_id", ""),
+        "task_contract_sha256": local_task_context.get("task_contract_sha256", ""),
         "api_request_id": api_request_id,
         "context_length": str(getattr(getattr(agent, "context_compressor", None), "context_length", 0) or ""),
         "ollama_num_ctx": str(getattr(agent, "_ollama_num_ctx", 0) or ""),

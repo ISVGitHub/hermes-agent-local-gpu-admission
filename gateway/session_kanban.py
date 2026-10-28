@@ -128,7 +128,7 @@ async def run_task(connection, params):
     from hermes_cli import kanban_db as kb
     import os
     import psutil
-    from hermes_cli.process_identity import worker_birth
+    from hermes_cli.process_identity import process_birth
     context = json.loads(policy.kanban_json)
 
     def admit_claim():
@@ -149,7 +149,7 @@ async def run_task(connection, params):
                     raise RuntimeStoreError('stale_kanban_claim')
                 kb._append_event(conn, task.id, 'owner_admitted',
                     {'db': owner_db, 'session_id': ref.session_id,
-                     'request_id': request_id, 'pid': os.getpid(), 'birth': worker_birth(psutil.Process())},
+                     'request_id': request_id, 'pid': os.getpid(), 'birth': process_birth(psutil.Process())},
                     run_id=task.current_run_id)
     from gateway.session_runtime_workers import tracked_write
     await tracked_write(authority, admit_claim)
@@ -188,9 +188,6 @@ def bind_worker_context(frame):
         'HERMES_KANBAN_CLAIM_LOCK': context['claim_lock'], 'HERMES_KANBAN_WORKSPACE': context['workspace'],
         'HERMES_KANBAN_WORKSPACES_ROOT': context['workspaces_root'], 'HERMES_PROFILE': context['profile'],
         'HERMES_SESSION_SOURCE': 'kanban'}
-    if context.get('capability_id'):
-        env['HERMES_KANBAN_CAPABILITY_ID'] = context['capability_id']
-        env['HERMES_KANBAN_CONTRACT_SHA256'] = context['task_contract_sha256']
     for key, value in (('HERMES_KANBAN_BRANCH', context['branch']), ('HERMES_TENANT', context['tenant'])):
         if value:
             env[key] = value
@@ -338,33 +335,6 @@ def _record_worker_result(context, code, last_output):
                  'last_output': last_output}, run_id=context['run_id'])
 
 
-def record_worker_loss(policy, reason, *, pid=None, bound=False):
-    """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
-
-    Dropped when the card has moved past the run (it says nothing about the current attempt).
-    Never raises: the caller's own loss handling must not depend on the board write.
-    """
-    try:
-        context = json.loads(policy.kanban_json or 'null')
-        if not context:
-            return
-        from hermes_cli.kanban_db_connect import connect_closing
-        from hermes_cli import kanban_db as kb
-        run_id = int(context['run_id'])
-        with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
-            row = conn.execute('SELECT status, current_run_id FROM tasks WHERE id=?',
-                               (context['task_id'],)).fetchone()
-            if row is None or row[0] != 'running' or row[1] != run_id:
-                return
-            kb._append_event(conn, context['task_id'], 'worker_lost',
-                             {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
-                              'run_id': run_id, 'pid': pid, 'bound': bool(bound)},
-                             run_id=run_id)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception('kanban worker_lost record failed')
-
-
 def _bound_worker_matches(conn, context):
     import os
     row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
@@ -401,9 +371,7 @@ def worker_exit_code(path, params):
     return worker_result(path, params).get('exit_code', 1)
 
 
-# Who wrote a card attempt's prompts: the dispatcher, never the operator, so memory providers do not
-# file "work kanban task t_..." and the worker's progress notes as the human's own turns (#137406).
-# Not a ``bot:<profile>`` id: a Bot Mode profile named ``kanban`` would share its memory key.
+# Who wrote a card attempt's prompts: the dispatcher, never the operator.
 KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'is_bot': True}
 
 
@@ -416,27 +384,35 @@ def _run_task_turns(agent, frame, history, context):
     local_capability = str(context.get('capability_id') or '')
     if local_capability:
         agent._local_gpu_admission_defer_release = True
-    try:
-        result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
-        if local_capability:
-            _complete_local_json_task(agent, result, context)
-    except Exception as exc:
-        if local_capability:
-            _block_local_json_task(context, f'Локальная задача остановлена: {str(exc)[:240]}')
-        raise
-    finally:
-        if local_capability:
-            try:
-                from hermes_cli.middleware import release_local_gpu_admission_leases
-                lease_ids = tuple(getattr(agent, '_local_gpu_admission_lease_ids', ()) or ())
-                scope = dict(getattr(agent, '_local_gpu_admission_scope', {}) or {})
-                if lease_ids and release_local_gpu_admission_leases(lease_ids=lease_ids, scope=scope):
-                    agent._local_gpu_admission_lease_ids = ()
-                    agent._local_gpu_admission_scope = {}
-                elif lease_ids:
-                    raise RuntimeError('GPU lease release failed; controller reconciliation is required')
-            finally:
-                agent._local_gpu_admission_defer_release = False
+    from agent.delegation_context import scoped_owned_local_gpu_task_context
+    local_context = {
+        'capability_id': local_capability,
+        'task_contract_sha256': str(context.get('task_contract_sha256') or ''),
+    } if local_capability else {}
+    with scoped_owned_local_gpu_task_context(local_context):
+        try:
+            result = agent.run_conversation(
+                prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR
+            )
+            if local_capability:
+                _complete_local_json_task(agent, result, context)
+        except Exception as exc:
+            if local_capability:
+                _block_local_json_task(context, f'Локальная задача остановлена: {str(exc)[:240]}')
+            raise
+        finally:
+            if local_capability:
+                try:
+                    from hermes_cli.middleware import release_local_gpu_admission_leases
+                    lease_ids = tuple(getattr(agent, '_local_gpu_admission_lease_ids', ()) or ())
+                    scope = dict(getattr(agent, '_local_gpu_admission_scope', {}) or {})
+                    if lease_ids and release_local_gpu_admission_leases(lease_ids=lease_ids, scope=scope):
+                        agent._local_gpu_admission_lease_ids = ()
+                        agent._local_gpu_admission_scope = {}
+                    elif lease_ids:
+                        raise RuntimeError('GPU lease release failed; controller reconciliation is required')
+                finally:
+                    agent._local_gpu_admission_defer_release = False
 
     def recover(nudge):
         nonlocal result
@@ -465,8 +441,7 @@ def _run_task_turns(agent, frame, history, context):
             kb.block_task(conn, context['task_id'], reason=reason, expected_run_id=context['run_id'])
     def turn(prompt):
         nonlocal result
-        result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id),
-                                        turn_author=KANBAN_TURN_AUTHOR)
+        result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id))
         return result.get('final_response', '')
     run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
