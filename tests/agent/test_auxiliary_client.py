@@ -40,6 +40,23 @@ from agent.auxiliary_client import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _reserved_example_hosts_are_explicit_mock_remotes(monkeypatch):
+    """Treat fixture-only example endpoints as remote mocks, not DNS evidence."""
+    from hermes_cli import local_model_routes
+
+    resolve_host = local_model_routes._host_resolves_to_local_address
+    mock_hosts = {"api.example.com", "gateway.example.com"}
+    monkeypatch.setattr(
+        local_model_routes,
+        "_host_resolves_to_local_address",
+        lambda host: (
+            False if host.lower().rstrip(".").endswith(".example")
+            or host.lower().rstrip(".") in mock_hosts else resolve_host(host)
+        ),
+    )
+
+
 def _jwt_with_claims(claims: dict) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
