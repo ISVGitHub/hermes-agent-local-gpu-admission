@@ -8,6 +8,8 @@ that just failed — so the retry re-fails and later attempts abort without a se
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor, pin_summary_route
 
 
@@ -43,14 +45,15 @@ def test_access_failed_aux_falls_back_to_named_main_route():
     assert (second.kwargs.get("model"), second.kwargs.get("provider")) == ("main-model", "main-provider")
 
 
-def test_local_admission_refusal_does_not_fallback_to_main_model():
+@pytest.mark.parametrize("refusal_type", ["auxiliary", "primary"])
+def test_local_admission_refusal_does_not_fallback_to_main_model(refusal_type):
     from agent.auxiliary_client import LocalAuxiliaryAdmissionRequired
+    from hermes_cli.middleware import LocalModelAdmissionBlockedError
 
     compressor = _compressor()
-    refusal = LocalAuxiliaryAdmissionRequired(
-        "Local auxiliary route refused before inference (task=compression); "
-        "this path has no task/run-bound GPU admission"
-    )
+    refusal_class = (LocalAuxiliaryAdmissionRequired if refusal_type == "auxiliary"
+                     else LocalModelAdmissionBlockedError)
+    refusal = refusal_class("local model admission refused before provider I/O")
     with patch.object(compressor, "_transcript_has_real_user_turn", return_value=False), patch(
         "agent.context_compressor.call_llm", side_effect=refusal,
     ) as mock_call:
@@ -59,7 +62,9 @@ def test_local_admission_refusal_does_not_fallback_to_main_model():
                 {"role": "assistant", "content": "do something"},
             ])
         except LocalAuxiliaryAdmissionRequired as exc:
-            assert "no task/run-bound GPU admission" in str(exc)
+            assert "local model admission refused" in str(exc)
+        except LocalModelAdmissionBlockedError as exc:
+            assert "local model admission refused" in str(exc)
         else:
             raise AssertionError("admission refusal must stop compression without fallback")
 
