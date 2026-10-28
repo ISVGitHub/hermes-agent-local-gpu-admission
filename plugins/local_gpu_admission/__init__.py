@@ -410,6 +410,44 @@ class ResourceBalancerController:
             raise ValueError("Resource Balancer is stale, blocked, or GPU-gated")
         return status
 
+    @staticmethod
+    def _validate_external_reservation(state_dir: Path, job_id: str,
+                                       scope: dict[str, str]) -> None:
+        """Validate a pre-spawn RB reservation carried through an exec handoff.
+
+        The dispatcher-side RB exec adapter owns the lease for the lifetime of
+        this worker. Environment metadata alone is never sufficient: the live
+        RB row must contain the same task/run/claim/contract/capability tuple.
+        """
+        conn = sqlite3.connect((state_dir / "queue.sqlite3").as_uri() + "?mode=ro",
+                               uri=True, timeout=1)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT j.class,j.state,r.context FROM jobs AS j "
+                "LEFT JOIN hermes_local_gpu_reservations AS r ON r.job_id=j.id WHERE j.id=?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise ValueError("Resource Balancer has no task-bound reservation table") from exc
+        finally:
+            conn.close()
+        if row is None or row["class"] != "gpu" or row["state"] != "running":
+            raise ValueError("pre-spawn Resource Balancer reservation is not active")
+        try:
+            reservation = json.loads(row["context"] or "")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pre-spawn reservation context is missing or malformed") from exc
+        expected = {
+            "task_id": scope["kanban_task_id"],
+            "run_id": scope["task_run_id"],
+            "claim_lock": scope["kanban_claim_lock"],
+            "task_contract_sha256": scope["task_contract_sha256"],
+            "capability_id": scope["capability_id"],
+        }
+        if reservation != expected:
+            raise ValueError("pre-spawn reservation does not match the current task/run contract")
+
     def _acquire(self, context: dict[str, Any]) -> dict[str, Any]:
         scope = self._scope(context)
         if not all(scope[field] for field in _ADMISSION_FIELDS):
@@ -423,22 +461,31 @@ class ResourceBalancerController:
             registry_hash, verifier_hash, verifier_path, fixture_hash, runtime_evidence, expected, response_format = self._load_oracle(task, scope)
             _rb_root, state_dir, _registry_path = self._configuration()
             self._resource_balancer_status(state_dir)
-            from resource_balancer.admission import admission
-            from resource_balancer.integration import process_identity
+            external_job_id = os.environ.get("RESOURCE_BALANCER_ADMISSION_JOB_ID", "").strip()
+            manager = None
+            if external_job_id:
+                self._validate_external_reservation(state_dir, external_job_id, scope)
+                job_id = external_job_id
+            else:
+                from resource_balancer.admission import admission
+                from resource_balancer.integration import process_identity
 
-            manager = admission(
-                "gpu", state_dir=state_dir, origin="hermes-kanban-local-model",
-                owner={"pid": os.getpid(), "start": process_identity(os.getpid())},
-            )
-            job_id = manager.__enter__()
+                manager = admission(
+                    "gpu", state_dir=state_dir, origin="hermes-kanban-local-model",
+                    owner={"pid": os.getpid(), "start": process_identity(os.getpid())},
+                )
+                job_id = manager.__enter__()
             try:
                 # Queue wait may outlive the original claim; re-read all identities after it obtains a slot.
                 task_after_wait = self._read_task(context)
+                if manager is None:
+                    self._validate_external_reservation(state_dir, str(job_id), scope)
                 self._resource_balancer_status(state_dir, str(job_id))
                 if task_after_wait.current_run_id != task.current_run_id:
                     raise ValueError("Kanban run changed while waiting for GPU admission")
             except Exception:
-                manager.__exit__(None, None, None)
+                if manager is not None:
+                    manager.__exit__(None, None, None)
                 raise
             lease = _ActiveLease(manager, str(job_id), scope, task_after_wait,
                                  registry_hash, verifier_hash, verifier_path, fixture_hash,
@@ -475,6 +522,11 @@ class ResourceBalancerController:
             if task_run_contract_sha256(task) != lease.admission_scope["task_contract_sha256"]:
                 raise ValueError("task contract changed during run")
             _rb_root, state_dir, registry_path = self._configuration()
+            if lease.manager is None:
+                external_job_id = os.environ.get("RESOURCE_BALANCER_ADMISSION_JOB_ID", "").strip()
+                if external_job_id != lease.job_id:
+                    raise ValueError("pre-spawn Resource Balancer reservation identity changed")
+                self._validate_external_reservation(state_dir, lease.job_id, scope)
             if _sha256(registry_path.read_bytes()) != lease.registry_hash:
                 raise ValueError("capability registry changed during run")
             if self._live_model_evidence(scope) != lease.runtime_evidence:
@@ -499,7 +551,8 @@ class ResourceBalancerController:
                 return self._block("release_refused", "No matching task/run lease to release")
             del self._leases[key]
         try:
-            lease.manager.__exit__(None, None, None)
+            if lease.manager is not None:
+                lease.manager.__exit__(None, None, None)
         except Exception:
             return self._block("release_failed", "Resource Balancer lease release failed")
         return {"decision": "released", "lease_ids": [lease.job_id], "scope": scope}
@@ -525,6 +578,12 @@ class ResourceBalancerController:
             if expected_scope.get(source) != task_scope.get(target):
                 return self._block("completion_scope_mismatch", "Completion scope differs from the admitted task")
         try:
+            _rb_root, state_dir, _registry_path = self._configuration()
+            if lease.manager is None:
+                external_job_id = os.environ.get("RESOURCE_BALANCER_ADMISSION_JOB_ID", "").strip()
+                if external_job_id != lease.job_id:
+                    raise ValueError("pre-spawn Resource Balancer reservation identity changed")
+                self._validate_external_reservation(state_dir, lease.job_id, task_scope)
             task = self._read_task({**task_scope, "task_id": key[0], "task_run_id": key[1],
                                     "kanban_claim_lock": key[2]})
             if (task.workspace_path != scope["workspace_path"]

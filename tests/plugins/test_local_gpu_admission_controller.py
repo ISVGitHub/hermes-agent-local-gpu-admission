@@ -75,6 +75,33 @@ def test_fresh_resource_balancer_global_block_refuses_admission(tmp_path):
         controller._resource_balancer_status(state_dir)
 
 
+def test_pre_spawn_reservation_must_match_exact_task_run_contract(tmp_path):
+    state_dir = tmp_path / "rb-state"
+    state_dir.mkdir()
+    scope = {
+        "kanban_task_id": "task-1", "task_run_id": "7", "kanban_claim_lock": "claim-a",
+        "task_contract_sha256": "a" * 64, "capability_id": "capability-1",
+    }
+    with sqlite3.connect(state_dir / "queue.sqlite3") as conn:
+        conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, class TEXT, state TEXT, context TEXT)")
+        conn.execute("CREATE TABLE hermes_local_gpu_reservations "
+                     "(job_id TEXT PRIMARY KEY, context TEXT NOT NULL, created_at REAL NOT NULL)")
+        conn.execute("INSERT INTO jobs VALUES (?,?,?,NULL)", ("gpu-job-1", "gpu", "running"))
+        conn.execute(
+            "INSERT INTO hermes_local_gpu_reservations VALUES (?,?,?)",
+            ("gpu-job-1", json.dumps({
+                "task_id": "task-1", "run_id": "7", "claim_lock": "claim-a",
+                "task_contract_sha256": "a" * 64, "capability_id": "capability-1",
+            }), time.time()),
+        )
+
+    ResourceBalancerController._validate_external_reservation(state_dir, "gpu-job-1", scope)
+    with pytest.raises(ValueError, match="does not match"):
+        ResourceBalancerController._validate_external_reservation(
+            state_dir, "gpu-job-1", {**scope, "task_run_id": "8"},
+        )
+
+
 def test_controller_rejects_task_run_id_that_differs_from_live_database(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

@@ -47,7 +47,25 @@ toolsets:
   - hermes-cli
 agent:
   disabled_toolsets: []
+plugins:
+  entries:
+    local_gpu_admission:
+      enabled: true
+      settings:
+        resource_balancer_python_path: RB_ROOT
+        resource_balancer_state_dir: RB_STATE
 """.lstrip(),
+        encoding="utf-8",
+    )
+    rb_root = tmp_path / "tools"
+    (rb_root / "resource_balancer").mkdir(parents=True)
+    (rb_root / "resource_balancer" / "admission.py").write_text("# fixture", encoding="utf-8")
+    rb_state = tmp_path / "rb-state"
+    rb_state.mkdir()
+    (rb_state / "queue.sqlite3").touch()
+    profile_config = profile.joinpath("config.yaml").read_text(encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        profile_config.replace("RB_ROOT", str(rb_root)).replace("RB_STATE", str(rb_state)),
         encoding="utf-8",
     )
     root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
@@ -84,7 +102,13 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
-    assert captured["cmd"][-2:] == ["-m", "hermes_cli.kanban_worker_client"]
+    assert captured["cmd"][:3] == [
+        kbd.sys.executable, "-m", "plugins.local_gpu_admission.rb_exec_entrypoint",
+    ]
+    command_start = captured["cmd"].index("--") + 1
+    assert captured["cmd"][command_start:command_start + 3] == [
+        kbd.sys.executable, "-m", "hermes_cli.kanban_worker_client",
+    ]
     assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
     assert captured["env"]["HERMES_KANBAN_CLAIM_LOCK"] == "lock"
     from hermes_cli.kanban_local_model_scope import task_run_contract_sha256
