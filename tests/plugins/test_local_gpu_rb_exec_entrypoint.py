@@ -47,6 +47,14 @@ def test_scope_unit_match_is_exact_enough_to_reject_neighbor_units():
                                 "0::/user.slice/hermes-worker-kanban-t1-run-7.scope")
     assert not _scope_contains_unit("hermes-worker-kanban-t1-run-7.scope",
                                     "0::/user.slice/hermes-worker-kanban-t1-run-70.scope")
+    assert not _scope_contains_unit("hermes-worker-kanban-t1-run-7.scope",
+                                    "0::/user.slice/prefix-hermes-worker-kanban-t1-run-7.scope")
+    assert not _scope_contains_unit("hermes-worker-kanban-t1-run-7.scope",
+                                    "0::/user.slice/hermes-worker-kanban-t1-run-7.scope.slice/child.scope")
+    assert not _scope_contains_unit("hermes-worker-kanban-t1-run-7.scope",
+                                    "0::/user.slice/hermes-worker-kanban-t1-run-7.scope-suffix")
+    assert not _scope_contains_unit("hermes-worker-kanban-t1-run-7.service",
+                                    "0::/user.slice/hermes-worker-kanban-t1-run-7.service")
 
 
 def test_scoped_worker_replaces_systemd_run_launcher_pid(monkeypatch, tmp_path):

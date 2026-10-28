@@ -17,7 +17,18 @@ import time
 
 
 def _scope_contains_unit(scope_unit: str, cgroup_text: str) -> bool:
-    return bool(scope_unit and any(scope_unit in line for line in cgroup_text.splitlines()))
+    if not scope_unit or not scope_unit.endswith(".scope"):
+        return False
+    for line in cgroup_text.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        # cgroup v1 and v2 both identify the systemd unit as a complete path
+        # component. Substring checks can accept a different unit or a crafted
+        # ancestor component that merely embeds the expected name.
+        if scope_unit in fields[2].strip("/").split("/"):
+            return True
+    return False
 
 
 def _task_is_still_claimed(db_path: str, context: dict[str, str], pid: int,
