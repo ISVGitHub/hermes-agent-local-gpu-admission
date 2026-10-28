@@ -51,14 +51,20 @@ def test_local_admission_refusal_does_not_fallback_to_main_model():
         "Local auxiliary route refused before inference (task=compression); "
         "this path has no task/run-bound GPU admission"
     )
-    with patch("agent.conversation_compression._raise_if_stale_attempt"):
+    with patch.object(compressor, "_transcript_has_real_user_turn", return_value=False), patch(
+        "agent.context_compressor.call_llm", side_effect=refusal,
+    ) as mock_call:
         try:
-            compressor._on_summary_failure(refusal, [], None, "")
+            compressor._generate_summary([
+                {"role": "assistant", "content": "do something"},
+            ])
         except LocalAuxiliaryAdmissionRequired as exc:
             assert "no task/run-bound GPU admission" in str(exc)
         else:
             raise AssertionError("admission refusal must stop compression without fallback")
 
+    assert mock_call.call_count == 1
+    assert mock_call.call_args.kwargs.get("model") == "quota-exhausted-aux"
     assert compressor.summary_model == "quota-exhausted-aux"
     assert compressor._last_summary_error == str(refusal)
 
