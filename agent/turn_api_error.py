@@ -285,7 +285,6 @@ def settle_unrecovered_error(
     # Admission refusals happen before local inference. Keep this machine-enforced
     # terminal boundary ahead of provider hooks, credential refresh, and fallback.
     if classified.reason == FailoverReason.local_admission_blocked:
-        from agent.turn_recovery import settle_delivered_partial
         delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         summary = agent._summarize_api_error(api_error)
         agent._flush_status_buffer()
