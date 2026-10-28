@@ -54,7 +54,13 @@ def daemon(tmp_path, model_peer, request):
     user = tmp_path / "user"
     user.mkdir()
     root = Path(__file__).resolve().parents[2]
-    model_url = f"http://127.0.0.1:{model_peer.server_port}/v1"
+    # Keep this generic ACP fixture outside the local-model admission gate:
+    # use a reserved .invalid provider host and an explicit loopback proxy to
+    # the fake peer. If proxy settings are ignored, DNS cannot send test data
+    # to a real provider and the local-route classifier won't mistake the
+    # fake server for an actual local model runtime.
+    model_url = "http://api.test.invalid/v1"
+    model_proxy = f"http://127.0.0.1:{model_peer.server_port}"
     config = {
         "gateway": {"multiplex_profiles": False},
         "approvals": {"mode": "manual", "timeout": 60},
@@ -74,6 +80,8 @@ def daemon(tmp_path, model_peer, request):
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home),
                PYTHONPATH=str(root), PYTHONUNBUFFERED="1",
                OPENAI_API_KEY="loopback-only", OPENAI_BASE_URL=model_url,
+               HTTP_PROXY=model_proxy, http_proxy=model_proxy,
+               NO_PROXY="127.0.0.1,localhost,::1", no_proxy="127.0.0.1,localhost,::1",
                HERMES_ACP_SKIP_CONFIGURED_MCP="1")
     command = [sys.executable, "-m", "gateway.run"]
     if getattr(request, 'param', None) == 'proposed-acp-descriptor':
